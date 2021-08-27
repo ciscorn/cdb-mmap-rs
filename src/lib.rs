@@ -1,21 +1,78 @@
 use std::{convert::TryInto, fs::File, io};
 
-use memmap2::MmapOptions;
+use memmap2::{ Mmap, MmapOptions };
 
 pub struct CDBReader {
     mmap: memmap2::Mmap,
     maintable: Vec<(u32, u32)>,
 }
 
-pub struct ValueIter<'a> {
-    CDBReader: &'a CDBReader,
+pub struct CDBValueIter<'a> {
+    mmap: &'a Mmap,  // todo: more abstruction
+    key: &'a [u8],
+    hashed_key: u32,
+    finished: bool,
+    curr_pos: usize,
+    pos_subtable: usize,
+    begin: usize,
+    end: usize,
 }
 
-impl<'a> Iterator for ValueIter<'a> {
+impl<'a> CDBValueIter<'a> {
+    fn new(reader: &'a CDBReader, key: &'a [u8]) -> Self {
+        let hashed_key = hashfunc(key);
+        let (pos_subtable, num_entries) = reader.maintable[(hashed_key % 256) as usize];
+        let pos_subtable = pos_subtable as usize;
+        assert!(pos_subtable >= 2048);
+
+        let hashed_high = hashed_key / 256;
+        let begin = pos_subtable + 8 * (hashed_high % num_entries) as usize;
+        let end = pos_subtable + 8 * num_entries as usize;
+        Self {
+            mmap: &reader.mmap,
+            key,
+            hashed_key,
+            finished: false,
+            curr_pos: begin,
+            pos_subtable,
+            begin,
+            end,
+        }
+    }
+}
+
+impl<'a> Iterator for CDBValueIter<'a> {
     type Item = &'a [u8];
 
     fn next(&mut self) -> Option<Self::Item> {
-        todo!()
+        if self.finished {
+            return None;
+        }
+        loop {
+            let (h, p) = to_u32pair(&self.mmap[self.curr_pos..(self.curr_pos + 8)]);
+            if p == 0 {
+                self.finished = true;
+                return None;
+            }
+            if h == self.hashed_key {
+                let p = p as usize;
+                let (klen, vlen) = to_u32pair(&self.mmap[p..(p + 8)]);
+                let pv = p + 8 + (klen as usize);
+                if &self.mmap[(p + 8)..pv] == self.key {
+                    let value = &self.mmap[pv..(pv + (vlen as usize))];
+                    return Some(value);
+                }
+            }
+
+            self.curr_pos += 8;
+            if self.curr_pos == self.begin {
+                self.finished = true; // mark finished
+                return None
+            }
+            else if self.curr_pos == self.end {
+                self.curr_pos = self.pos_subtable;
+            }
+        }
     }
 }
 
@@ -32,7 +89,7 @@ fn to_u32pair(x: &[u8]) -> (u32, u32) {
 }
 
 impl CDBReader {
-    pub fn new(path: &str) -> io::Result<CDBReader> {
+    pub fn new(path: &str) -> io::Result<Self> {
         let mmap = {
             let file = File::open(path)?;
             unsafe { MmapOptions::new().map(&file)? }
@@ -52,39 +109,8 @@ impl CDBReader {
         Ok(CDBReader { mmap, maintable })
     }
 
-    pub fn get(&self, key: &[u8]) -> Option<&[u8]> {
-        let hashed = hashfunc(key);
-        let hash_pos_iter = {
-            let (pos_subtable, num_entries) = self.maintable[(hashed % 256) as usize];
-            let pos_subtable = pos_subtable as usize;
-            assert!(pos_subtable >= 2048);
-
-            let hashed_high = hashed / 256;
-            let begin = pos_subtable + 8 * (hashed_high % num_entries) as usize;
-            let end = pos_subtable + 8 * num_entries as usize;
-            let iter1 = self.mmap[begin..(end + 8)].chunks_exact(8).map(to_u32pair);
-            let iter2 = self.mmap[pos_subtable..(begin + 8)]
-                .chunks_exact(8)
-                .map(to_u32pair);
-            iter1.chain(iter2)
-        };
-
-        for (h, p) in hash_pos_iter.into_iter() {
-            if p == 0 {
-                return None;
-            }
-            if h == hashed {
-                let p = p as usize;
-                let (klen, vlen) = to_u32pair(&self.mmap[p..(p + 8)]);
-                let (klen, vlen) = (klen as usize, vlen as usize);
-                let pv = p + 8 + klen;
-                if &self.mmap[(p + 8)..pv] == key {
-                    let value = &self.mmap[pv..(pv + vlen)];
-                    return Some(value);
-                }
-            }
-        }
-        return None;
+    pub fn get<'a>(&'a self, key: &'a [u8]) -> Option<&[u8]> {
+        CDBValueIter::new(self, key).next()
     }
 }
 
